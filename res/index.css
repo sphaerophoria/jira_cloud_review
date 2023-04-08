@@ -1,0 +1,16 @@
+.collapsible-content {
+  display: none;
+}
+
+.collapsible-header {
+  cursor: pointer;
+}
+
+.collapsible-header:after {
+  content: '+';
+  float: right;
+}
+
+.collapsible-header.active:after {
+  content: '-';
+}
