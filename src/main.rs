@@ -158,7 +158,7 @@ impl Error for ImageDownloadError {
     }
 }
 
-async fn download_src_for_img(
+async fn download_src(
     uri: &str,
     credentials: &Credentials,
     src: String,
@@ -170,7 +170,13 @@ async fn download_src_for_img(
     }
 
     // Strip leading /
-    let src = &src[1..];
+    let mut src = &src[1..];
+
+    // Strip trailing query params
+    if let Some(pos) = src.find('?') {
+        src = &src[..pos];
+    }
+
     let img_uri = format!("{uri}/{src}");
     info!("Downloading: {img_uri}");
 
@@ -223,11 +229,8 @@ fn download_image_links_in_node<'a>(
     if let html_parser::Node::Element(elem) = node {
         debug!("{:?}", elem);
 
-        if elem.name == "img" {
-            if let Some(Some(src)) = elem.attributes.get("src") {
-                futures
-                    .push(download_src_for_img(uri, credentials, src.to_string(), output).boxed());
-            }
+        if let Some(Some(src)) = elem.attributes.get("src") {
+            futures.push(download_src(uri, credentials, src.to_string(), output).boxed());
         }
 
         for node in elem.children {
