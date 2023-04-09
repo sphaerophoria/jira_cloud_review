@@ -571,6 +571,22 @@ async fn async_main() -> Result<(), MainError> {
         if filtered_comments.is_empty() {
             continue;
         }
+
+        let download_futures =
+            futures::future::join_all(filtered_comments.iter().map(|(comment, _)| {
+                download_image_links(
+                    &args.uri,
+                    &credentials,
+                    &comment.rendered_body,
+                    &args.output,
+                )
+            }))
+            .await;
+
+        for res in download_futures {
+            res.map_err(MainError::DownloadImageFailed)?;
+        }
+
         // FIXME: do not show title if no comments pass filter
         writeln!(
             output_index_html,
@@ -593,16 +609,6 @@ async fn async_main() -> Result<(), MainError> {
                 "{} left comment on {} on {}, adding to output",
                 args.user, issue.key, comment_date
             );
-
-            // FIXME: parallelize the retrieval of images
-            download_image_links(
-                &args.uri,
-                &credentials,
-                &comment.rendered_body,
-                &args.output,
-            )
-            .await
-            .map_err(MainError::DownloadImageFailed)?;
 
             writeln!(output_index_html, "<h3>{comment_time}</h3>")
                 .map_err(MainError::OutputWriteFailed)?;

@@ -101,7 +101,6 @@ pub fn execute_search(
 
     let mut issues = Vec::new();
 
-    // FIXME: async better here
     loop {
         debug!("Issuing search to {uri}: {request:?}");
 
@@ -212,7 +211,6 @@ pub async fn get_comments(
 
     let mut comments = Vec::new();
 
-    // FIXME: async better here
     loop {
         let uri = format!("{uri}/rest/api/3/issue/{issue_key}/comment?expand=renderedBody&startAt={start_at}&maxResults={max_results}");
 
