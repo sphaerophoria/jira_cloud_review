@@ -9,13 +9,13 @@ use isahc::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
+use futures::future::BoxFuture;
+
 use std::{
     error::Error,
     fmt, fs,
-    future::Future,
     io::{self, Write},
     path::{Path, PathBuf},
-    pin::Pin,
 };
 
 mod jira_api;
@@ -229,13 +229,12 @@ async fn download_src(
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
 fn download_image_links_in_node<'a>(
     uri: &'a str,
     credentials: &'a Credentials,
     node: html_parser::Node,
     output: &'a Path,
-) -> Vec<Pin<Box<dyn Future<Output = Result<(), ImageDownloadError>> + 'a + Send>>> {
+) -> Vec<BoxFuture<'a, Result<(), ImageDownloadError>>> {
     let mut futures = Vec::new();
     if let html_parser::Node::Element(elem) = node {
         debug!("{:?}", elem);
