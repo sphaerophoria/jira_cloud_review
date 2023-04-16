@@ -20,6 +20,8 @@ use std::{
 
 mod jira_api;
 
+use jira_api::{HttpJiraClient, JiraClient, ReplayJiraClient};
+
 const WATER_CSS: &[u8] = include_bytes!("../res/water.css");
 const INDEX_CSS: &[u8] = include_bytes!("../res/index.css");
 const INDEX_JS: &[u8] = include_bytes!("../res/index.js");
@@ -177,7 +179,20 @@ async fn download_src(
         src = &src[..pos];
     }
 
+    let decoded_src = urlencoding::decode(src).map_err(ImageDownloadError::DecodePath)?;
+    let dst = output.join(decoded_src.as_ref());
+    debug!("output: {}", dst.display());
+
     let img_uri = format!("{uri}/{src}");
+
+    if dst.exists() {
+        info!(
+            "Skipping {img_uri}, output {dst} exists",
+            dst = dst.display()
+        );
+        return Ok(());
+    }
+
     info!("Downloading: {img_uri}");
 
     let mut img_response = Request::get(&img_uri)
@@ -198,10 +213,6 @@ async fn download_src(
         .read_to_end(&mut img_data)
         .await
         .map_err(ImageDownloadError::ReadImg)?;
-
-    let decoded_src = urlencoding::decode(src).map_err(ImageDownloadError::DecodePath)?;
-    let dst = output.join(decoded_src.as_ref());
-    debug!("{}", dst.display());
 
     fs::create_dir_all(dst.parent().unwrap_or(output)).map_err(ImageDownloadError::CreateDir)?;
 
@@ -308,6 +319,8 @@ struct Args {
     user: String,
     output: PathBuf,
     start_date: NaiveDate,
+    record_path: Option<PathBuf>,
+    replay_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -321,11 +334,16 @@ impl Args {
                  Example:\n\
                  {process_name} --uri https://my-jira-instance.atlassian.net --user \"Display Name\" --output output_folder\n\
                  \n\
-                 Options:\n\
+                 Required Options:\n\
                  --uri          Uri to jira instance\n\
                  --user         Display name to filter results with\n\
                  --output       Where to output the processed data\n\
                  --start-date   Initial date in form of YYYY-MM-DD\n\
+                 \n\
+                 Optional Options:\n\
+                 --record-path  Where to store intermediate outputs, debugging feature\n\
+                 --replay-path  If provided, no http requests will be made, and the output will be\n\
+                                re-constructed from the recorded results of the recording\n\
                  ",
             process_name = process_name.display()
         )
@@ -343,6 +361,8 @@ impl Args {
         let mut user = None;
         let mut output = None;
         let mut date = None;
+        let mut record_path = None;
+        let mut replay_path = None;
         while let Some(item) = iter.next() {
             let item = item.as_ref();
             match item {
@@ -350,17 +370,14 @@ impl Args {
                     eprintln!("{}", Args::help());
                     std::process::exit(1);
                 }
-                "--user" => {
-                    let val = iter.next();
-                    user = val;
+                "--user" => user = iter.next(),
+                "--uri" => uri = iter.next(),
+                "--output" => output = iter.next(),
+                "--record-path" => {
+                    record_path = iter.next().map(|x| Path::new(x.as_ref()).to_owned());
                 }
-                "--uri" => {
-                    let val = iter.next();
-                    uri = val;
-                }
-                "--output" => {
-                    let val = iter.next();
-                    output = val;
+                "--replay-path" => {
+                    replay_path = iter.next().map(|x| Path::new(x.as_ref()).to_owned());
                 }
                 "--start-date" => {
                     if let Some(val) = iter.next() {
@@ -388,6 +405,8 @@ impl Args {
             user,
             output,
             start_date,
+            record_path,
+            replay_path,
         })
     }
 }
@@ -395,6 +414,7 @@ impl Args {
 enum MainError {
     ArgParseError(ArgParseError),
     Auth(GetAuthError),
+    ConstructClient(jira_api::JiraClientCreationError),
     Search(jira_api::SearchError),
     GetComments(jira_api::GetCommentError),
     WriteCss(io::Error),
@@ -414,6 +434,10 @@ impl fmt::Debug for MainError {
             }
             MainError::Auth(e) => {
                 writeln!(f, "failed to get authorization")?;
+                Some(e)
+            }
+            MainError::ConstructClient(e) => {
+                writeln!(f, "failed to construct jira client")?;
                 Some(e)
             }
             MainError::Search(e) => {
@@ -459,15 +483,15 @@ impl fmt::Debug for MainError {
 }
 
 async fn get_comments_for_issue(
-    uri: &str,
-    credentials: &Credentials,
+    client: &dyn JiraClient,
     issue: jira_api::IssueBean,
 ) -> Result<(jira_api::IssueBean, Vec<jira_api::Comment>), MainError> {
     // Look through comments to see if any were written by the given user
     info!("Retrieving comments for {}", issue.key);
 
     // FIXME: Sort by date maybe?
-    let comments = jira_api::get_comments(uri, credentials, issue.key.clone())
+    let comments = client
+        .get_comments(issue.key.clone())
         .await
         .map_err(MainError::GetComments)?;
 
@@ -492,6 +516,14 @@ async fn async_main() -> Result<(), MainError> {
 
     let credentials = Credentials::new(auth.user, auth.password);
 
+    let client: Box<dyn JiraClient> = match &args.replay_path {
+        Some(v) => Box::new(ReplayJiraClient::new(v.to_path_buf())),
+        None => Box::new(
+            HttpJiraClient::new(&args.uri, &credentials, args.record_path)
+                .map_err(MainError::ConstructClient)?,
+        ),
+    };
+
     let date_str = format!(
         "{}-{}-{}",
         args.start_date.year(),
@@ -502,8 +534,7 @@ async fn async_main() -> Result<(), MainError> {
 
     info!("Retrieving all issues that match fiilter \"{jql}\"");
 
-    let issues =
-        jira_api::execute_search(&args.uri, &credentials, jql).map_err(MainError::Search)?;
+    let issues = client.execute_search(jql).map_err(MainError::Search)?;
 
     info!("Found {} issues", issues.len());
 
@@ -540,7 +571,7 @@ async fn async_main() -> Result<(), MainError> {
     let issue_comments = futures::future::join_all(
         issues
             .into_iter()
-            .map(|issue| get_comments_for_issue(&args.uri, &credentials, issue)),
+            .map(|issue| get_comments_for_issue(&*client, issue)),
     )
     .await;
 
