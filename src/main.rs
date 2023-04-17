@@ -1,11 +1,11 @@
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate};
 use futures::prelude::*;
-use html_parser::Dom;
 use isahc::{
     auth::{Authentication, Credentials},
     prelude::*,
     Request,
 };
+use lol_html::{element, HtmlRewriter, Settings};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
@@ -118,7 +118,6 @@ fn get_auth() -> Result<AuthData, GetAuthError> {
 
 #[derive(Debug)]
 enum ImageDownloadError {
-    HtmlParseFail(html_parser::Error),
     HttpRequest(isahc::http::Error),
     HttpSend(isahc::Error),
     CreateDir(io::Error),
@@ -131,7 +130,6 @@ enum ImageDownloadError {
 impl fmt::Display for ImageDownloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ImageDownloadError::HtmlParseFail(_) => write!(f, "failed to parse html"),
             ImageDownloadError::HttpRequest(_) => {
                 write!(f, "failed to generate image download request")
             }
@@ -148,7 +146,6 @@ impl fmt::Display for ImageDownloadError {
 impl Error for ImageDownloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            ImageDownloadError::HtmlParseFail(e) => Some(e),
             ImageDownloadError::HttpRequest(e) => Some(e),
             ImageDownloadError::HttpSend(e) => Some(e),
             ImageDownloadError::CreateDir(e) => Some(e),
@@ -229,52 +226,52 @@ async fn download_src(
     Ok(())
 }
 
-fn download_image_links_in_node<'a>(
-    uri: &'a str,
-    credentials: &'a Credentials,
-    node: html_parser::Node,
-    output: &'a Path,
-) -> Vec<BoxFuture<'a, Result<(), ImageDownloadError>>> {
-    let mut futures = Vec::new();
-    if let html_parser::Node::Element(elem) = node {
-        debug!("{:?}", elem);
-
-        if let Some(Some(src)) = elem.attributes.get("src") {
-            futures.push(download_src(uri, credentials, src.to_string(), output).boxed());
-        }
-
-        for node in elem.children {
-            for future in download_image_links_in_node(uri, credentials, node, output) {
-                futures.push(future.boxed());
-            }
-        }
-    }
-
-    futures
+struct DomWalkResult<'a> {
+    healed_html: Vec<u8>,
+    download_futures: Vec<BoxFuture<'a, Result<(), ImageDownloadError>>>,
 }
 
-async fn download_image_links(
-    uri: &str,
-    credentials: &Credentials,
+fn download_and_heal_absolute_links<'a>(
+    uri: &'a str,
+    credentials: &'a Credentials,
+    output_path: &'a Path,
     html: &str,
-    output: &Path,
-) -> Result<(), ImageDownloadError> {
-    let dom = Dom::parse(html).map_err(ImageDownloadError::HtmlParseFail)?;
+) -> Result<DomWalkResult<'a>, lol_html::errors::RewritingError> {
+    let mut healed_html = Vec::new();
+    let mut download_futures = Vec::new();
 
-    let mut futures = Vec::new();
-    for node in dom.children {
-        futures.extend(download_image_links_in_node(uri, credentials, node, output));
-    }
+    let mut rewriter = HtmlRewriter::new(
+        Settings {
+            element_content_handlers: vec![element!("[src]", |el| {
+                let src = el
+                    .get_attribute("src")
+                    .expect("src attribute required by selector");
 
-    let results = futures::future::join_all(futures).await;
-    for res in results {
-        if let Err(e) = res {
-            // FIXME: Note which download failed
-            error!("{}", e);
-        }
-    }
+                if let Some(relative) = src.strip_prefix('/') {
+                    el.set_attribute("src", relative)
+                        .expect("src attribute could not be set");
+                }
 
-    Ok(())
+                download_futures
+                    .push(download_src(uri, credentials, src.to_string(), output_path).boxed());
+
+                Ok(())
+            })],
+            ..Settings::default()
+        },
+        |c: &[u8]| healed_html.extend_from_slice(c),
+    );
+
+    rewriter.write(html.as_bytes())?;
+
+    drop(rewriter);
+
+    let result = DomWalkResult {
+        healed_html,
+        download_futures,
+    };
+
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -414,6 +411,7 @@ enum MainError {
     ArgParseError(ArgParseError),
     Auth(GetAuthError),
     ConstructClient(jira_api::JiraClientCreationError),
+    HtmlRewrite(lol_html::errors::RewritingError),
     Search(jira_api::SearchError),
     GetComments(jira_api::GetCommentError),
     WriteCss(io::Error),
@@ -437,6 +435,10 @@ impl fmt::Debug for MainError {
             }
             MainError::ConstructClient(e) => {
                 writeln!(f, "failed to construct jira client")?;
+                Some(e)
+            }
+            MainError::HtmlRewrite(e) => {
+                writeln!(f, "failed to rewrite html with relative src links")?;
                 Some(e)
             }
             MainError::Search(e) => {
@@ -557,8 +559,8 @@ async fn async_main() -> Result<(), MainError> {
     writeln!(
         output_index_html,
         "<head>\n\
-         \t<link rel=\"stylesheet\" href=\"/water.css\">\n\
-         \t<link rel=\"stylesheet\" href=\"/index.css\">\n\
+         \t<link rel=\"stylesheet\" href=\"water.css\">\n\
+         \t<link rel=\"stylesheet\" href=\"index.css\">\n\
          \t<meta content=\"text/html;charset=utf-8\" http-equiv=\"Content-Type\">\n\
          \t<meta content=\"utf-8\" http-equiv=\"encoding\">\n\
          \t<script src=\"index.js\" defer></script>\n\
@@ -573,6 +575,8 @@ async fn async_main() -> Result<(), MainError> {
             .map(|issue| get_comments_for_issue(&*client, issue)),
     )
     .await;
+
+    let mut download_futures = Vec::new();
 
     for issue_comment in issue_comments {
         let (issue, comments) = match issue_comment {
@@ -605,21 +609,6 @@ async fn async_main() -> Result<(), MainError> {
             continue;
         }
 
-        let download_futures =
-            futures::future::join_all(filtered_comments.iter().map(|(comment, _)| {
-                download_image_links(
-                    &args.uri,
-                    &credentials,
-                    &comment.rendered_body,
-                    &args.output,
-                )
-            }))
-            .await;
-
-        for res in download_futures {
-            res.map_err(MainError::DownloadImageFailed)?;
-        }
-
         // FIXME: do not show title if no comments pass filter
         writeln!(
             output_index_html,
@@ -646,7 +635,18 @@ async fn async_main() -> Result<(), MainError> {
             writeln!(output_index_html, "<h3>{comment_time}</h3>")
                 .map_err(MainError::OutputWriteFailed)?;
 
-            writeln!(output_index_html, "{}", comment.rendered_body)
+            let dom_walk_result = download_and_heal_absolute_links(
+                &args.uri,
+                &credentials,
+                &args.output,
+                &comment.rendered_body,
+            )
+            .map_err(MainError::HtmlRewrite)?;
+
+            download_futures.extend(dom_walk_result.download_futures);
+
+            output_index_html
+                .write_all(&dom_walk_result.healed_html)
                 .map_err(MainError::OutputWriteFailed)?;
         }
 
@@ -654,6 +654,12 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     write!(output_index_html, "</body>").map_err(MainError::OutputWriteFailed)?;
+
+    let download_futures = futures::future::join_all(download_futures).await;
+
+    for res in download_futures {
+        res.map_err(MainError::DownloadImageFailed)?;
+    }
 
     Ok(())
 }
